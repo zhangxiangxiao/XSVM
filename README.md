@@ -1,0 +1,1 @@
+XSVM is a Kernel-SVM library implemented in pure Torch 7
