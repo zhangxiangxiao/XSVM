@@ -583,7 +583,7 @@ function xsvm.platt(args)
    local function examineExample_cache(dataset, i2)
       local y2 = dataset[i2][2][1]
       local alph2 = model.a[i2] or 0
-      local E2 = model:f(dataset[i2][1])[1] - y2
+      local E2 = kcache_f(dataset, i2)[1] - y2
       local r2 = E2*y2
       local E1 = 0
       local i1 = 0
