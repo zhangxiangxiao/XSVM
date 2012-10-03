@@ -22,10 +22,11 @@ along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 DOCUMENTATION
 
-This library contains two SMO (sequential minimal optimization) variants for
-kernel support vector machines.
+This library contains SMO (sequential minimal optimization) variants for kernel
+support vector machines.
 xsvm.simple(args): A simplified SMO algorithm[1]
 xsvm.platt(args): John C. Platt's original SMO algorithm[2]
+xsvm.tweaked(args): A tweaked heuristic version of Platt's algorithm
 
 They can be used in this way:
 model = xsvm.simple{C = 0.05, cache = true, kernel = kfunc} -- create model
@@ -34,14 +35,17 @@ model:test(dataset) -- Test on a dataset. The testing error is returned.
 vmodel:f(x) -- The output function
 model:g(x) -- The decision function (return -1 or 1)
 
-xsvm.simple() and xsvm.platt() have the same protocols for controlling the
-parameter C (default 0.05), whether to cache (default false) and the kernel
-function (default is inner-product between vectors, i.e., linear model)
+xsvm.simple(), xsvm.platt() and xsvm.tweaked have the same protocols for
+controlling the parameter C (default 0.05), whether to cache (default false)
+and the kernel function (default is inner-product between vectors, i.e.,
+linear model)
 
 Generally speaking, xsvm.simple() is faster but its result is random because
 it does not exactly solve the problem. It also does not handle non-PSD kernels
 well. xsvm.platt() is the original SMO algorithm which gives consistent
-solution, and sometimes it will handle non-PSD kernels.
+solution, and sometimes it will handle non-PSD kernels. xsvm.tweaked() is a
+heuristic version of the original SMO algorithm, which is much faster, but
+its optimality may not be as good.
 
 The dataset format follows the convention of Torch 7 tutorial, and I quote it
 here:
