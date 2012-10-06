@@ -1,7 +1,7 @@
 --[[
 Xiang's Kernel SVM :)
 By Xiang Zhang @ New York University
-10/02/2012, Version 0.1
+10/06/2012, Version 0.3
 
 ---------------------------------------------
 
@@ -27,25 +27,47 @@ support vector machines.
 xsvm.simple(args): A simplified SMO algorithm[1]
 xsvm.platt(args): John C. Platt's original SMO algorithm[2]
 xsvm.tweaked(args): A tweaked heuristic version of Platt's algorithm
+xsvm.vectorized(args): A vectorized version of the tweaked algorithm
+xsvm.fast(args): A vectorized version of Platt's original SMO algorithm
 
 They can be used in this way:
 model = xsvm.simple{C = 0.05, cache = true, kernel = kfunc} -- create model
 model:train(dataset) -- Train on a dataset. The training error is returned.
 model:test(dataset) -- Test on a dataset. The testing error is returned.
-vmodel:f(x) -- The output function
-model:g(x) -- The decision function (return -1 or 1)
+model:f(x) -- The output function
+model:g(x) -- The decision function (return -1 or 1 as a tensor)
+model:nsv() -- Query how many support vectors are there for a trained model
 
-xsvm.simple(), xsvm.platt() and xsvm.tweaked have the same protocols for
+xsvm.simple(), xsvm.platt() and xsvm.tweaked() have the same protocols for
 controlling the parameter C (default 0.05), whether to cache (default false)
 and the kernel function (default is inner-product between vectors, i.e.,
-linear model)
+linear model). You will not be able to control whether to cache in
+xsvm.vectorized() and xsvm.fast(). They must enable cache for vectorization.
 
-Generally speaking, xsvm.simple() is faster but its result is random because
-it does not exactly solve the problem. It also does not handle non-PSD kernels
-well. xsvm.platt() is the original SMO algorithm which gives consistent
-solution, and sometimes it will handle non-PSD kernels. xsvm.tweaked() is a
-heuristic version of the original SMO algorithm, which is much faster, but
-its optimality may not be as good.
+We recommend you to use xsvm.vectorized() if memory is not a constraint.
+Otherwise, xsvm.tweaked() is probably the best option.
+
+Generally speaking, xsvm.simple() is just an example code to understand the
+algorithm. Do not use it in actual applications, because the result is random
+as it does not exactly solve the problem. xsvm.platt() is the original SMO
+algorithm which gives consistent solution. xsvm.tweaked() is a heuristic
+version of the original SMO algorithm, which is much faster, but its optimality
+may not be as good (but not bad as well). xsvm.fast() is the vectorized version
+of xsvm.platt(). xsvm.vectorized() is the vectorized version of xsvm.tweaked().
+
+The speed comparison of the algorithms are generally as the follows ('>'
+represents faster than):
+xsvm.vectorized() > xsvm.fast() > xsvm.tweaked() > xsvm.simple() > xsvm.platt()
+
+The memory usage comparision of the algorithms are as follows ('>' represents
+more memory usage):
+xsvm.vectorized() = xsvm.fast() > xsvm.tweaked{cache = true} = xsvm.platt{
+cache = true} = xsvm.simple{cache = true} > xsvm.tweaked{cache = false} =
+xsvm.platt{cache = false} = xsvm.simple{cache = false}
+
+The optimality comparison of the algorithms are as follows ('>' represents
+better optimality guarantee):
+xsvm.fast() = xsvm.platt() > xsvm.vectorized() = xsvm.tweaked() > xsvm.simple()
 
 The dataset format follows the convention of Torch 7 tutorial, and I quote it
 here:
@@ -55,6 +77,12 @@ examples and dataset[i] has to return the i-th example. An example has to be
 an object which implements the operator example[field], where field often
 takes the value 1 (for input features) or 2 (for corresponding labels), i.e
 an example is a pair of input and output objects."
+
+The support vectors are stored in the table model.a, where if model.a[i] = nil
+it means the dual variable with respect to the i training sample is 0. Support
+vectors and their labels are stored in table model.x and model.y respectively,
+following the same convention as model.a. The bias parameter is stored at
+model.b.
 
 ---------------------------------------------
 
@@ -1460,6 +1488,657 @@ function xsvm.tweaked(args)
       else
 	 train_ncache(dataset, ratio_alpha_changes*dataset:size())
       end
+      return model:test(dataset)
+   end
+   -- Test on a dataset
+   function model:test(dataset)
+      -- Counter for wrong classification
+      local error = 0
+      for i = 1,dataset:size() do
+	 -- Iterate error rate computation
+	 if torch.sum(torch.ne(model:g(dataset[i][1]), dataset[i][2])) == 0 then
+	    error = error*(i-1)/i
+	 else
+	    error = (error*i-error+1)/i
+	 end
+      end
+      return error
+   end
+   -- The decision function
+   function model:f(x)
+      local result = torch.zeros(1)
+      -- Iterate over all pairs
+      for k,v in pairs(model.a) do
+	 result[1] = result[1] + model.y[k]*model.a[k]*kernel(model.x[k],x)
+      end
+      result[1] = result[1] + model.b
+      -- Return result as a tensor
+      return result
+   end
+   -- The indicator function
+   function model:g(x)
+      local result = model:f(x)
+      if result[1] >= 0 then
+	 return torch.ones(1)
+      else
+	 return -torch.ones(1)
+      end
+   end
+   -- The number of support vectors
+   function model:nsv()
+      local count = 0
+      for k,v in pairs(model.a) do
+	 count = count + 1
+      end
+      return count
+   end
+   -- Return the object
+   return model
+end
+
+-- Vectorized Tweaked Platt's SMO algorithm
+-- C: the regularization parameter
+-- kernel: the kernel function; tol: tolerance on violation of KKT conditions
+-- eps: the eps to detect change; ratio_alpha_changed: a heuristic for stopping
+function xsvm.vectorized(args)
+   local model = {a = {}, x = {}, y = {}, b = 0}
+   args = args or {}
+   -- If kernel undefined, using linear kernel
+   local kernel = args.kernel or function (x1,x2) return torch.dot(x1,x2) end
+   -- Default C is 1
+   local C = args.C or 0.05
+   -- Default tolerance is 1e-3
+   local tol = args.tol or 1e-3
+   -- Default eps (round-off error on Mercer condition) is 1e-5
+   local eps = args.eps or 1e-5
+   -- Default ratio alpha changes is 1%
+   local ratio_alpha_changes = args.ratio_alpha_changes or 0.01
+   -- Recording the number of non-zero & non-C alpha
+   local nbound = 0
+   -- Cache helper
+   local ecache = torch.zeros(1)
+   local kcache = torch.zeros(1)
+   local ycache = torch.zeros(1)
+   local acache = torch.zeros(1)
+   -- Initializing the kernel cache
+   local function kcache_init(dataset)
+      -- Allocate cache tensors
+      ycache = torch.zeros(dataset:size())
+      acache = torch.zeros(dataset:size())
+      ecache = torch.zeros(dataset:size())
+      kcache = torch.zeros(dataset:size(), dataset:size())
+      for i = 1, dataset:size() do
+	 ycache[i] = dataset[i][2][1]
+	 for j = i, dataset:size() do
+	    local k = kernel(dataset[i][1],dataset[j][1])
+	    kcache[i][j] = k
+	    kcache[j][i] = k
+	 end
+      end
+   end
+   -- Query the cached value
+   local function kcache_query(dataset, i, j)
+      -- Return the cache
+      return kcache[i][j]
+   end
+   -- kcache utilized f function
+   local function kcache_f(dataset, i)
+      -- Return result as a tensor
+      return torch.ones(1)*(torch.dot(torch.cmul(acache,ycache), kcache[i]) + model.b);
+   end
+   -- Clean up the cache
+   local function kcache_clean()
+      kcache = torch.zeros(1)
+      ycache = torch.zeros(1)
+      acache = torch.zeros(1)
+      ecache = torch.zeros(1)
+   end
+   -- Cached helper takeStep function
+   local function takeStep_cache(dataset, i1, i2, E1, E2)
+      if i1 == i2 then
+	 return 0
+      end
+      -- Allocating values
+      local alph1 = model.a[i1] or 0
+      local alph2 = model.a[i2] or 0
+      local y1 = dataset[i1][2][1]
+      local y2 = dataset[i2][2][1]
+      local s = y1*y2
+      local L = 0
+      local H = C
+      if y1 == y2 then
+	 L = math.max(0, alph2 + alph1 - C)
+	 H = math.min(C, alph2 + alph1)
+      else
+	 L = math.max(0, alph2 - alph1)
+	 H = math.min(C, C + alph2 - alph1)
+      end
+      -- Compute the kernel values and step size
+      local k11 = kcache_query(dataset,i1,i1)
+      local k12 = kcache_query(dataset,i1,i2)
+      local k22 = kcache_query(dataset,i2,i2)
+      local eta = k11 + k22 - 2*k12
+      local a1 = alph1
+      local a2 = alph2
+      -- Check feasibility of eta (Mercer kernel)
+      if eta > 0 then
+	 -- Compute the new value of a2
+	 a2 = alph2 + y2*(E1-E2)/eta
+	 if a2 < L then
+	    a2 = L
+	 elseif a2 > H then
+	    a2 = H
+	 end
+      else
+	 local f1 = y1*(E1-model.b)-alph1*k11-s*alph2*k12
+	 local f2 = y1*(E2-model.b)-s*alph1*k12-alph2*k22
+	 local L1 = alph1 + s*(alph2 - L)
+	 local H1 = alph1 + s*(alph2 - H)
+	 local Lobj = L1*f1 + L*f2 + L1*L1*k11/2 + L*L*k22/2 + s*L*L1*k12
+	 local Hobj = H1*f1 + H*f2 + H1*H1*k11/2 + H*H*k22/2 + s*H*H1*k12
+	 -- Determine the new value of a2
+	 if Lobj < Hobj - eps then
+	    a2 = L
+	 elseif Lobj > Hobj + eps then
+	    a2 = H
+	 else
+	    a2 = alph2
+	 end
+      end
+      -- Do we change alph2 enough?
+      if math.abs(a2-alph2) < eps*(a2 + alph2 + eps) then
+	 return 0
+      end
+      -- Update a1
+      a1 = alph1 + s*(alph2 - a2)
+      -- Update multiplier a1
+      if a1 > 0 then
+	 model.a[i1] = a1
+	 acache[i1] = a1
+	 model.x[i1] = dataset[i1][1]
+	 model.y[i1] = dataset[i1][2][1]
+	 -- Keep track of nbound values
+	 if a1 < C and (alph1 >= C or alph1 <= 0) then
+	    nbound = nbound + 1
+	 elseif a1 >= C and alph1 < C and alph1 > 0 then
+	    nbound = nbound - 1
+	 end
+      else
+	 model.a[i1] = nil
+	 acache[i1] = 0
+	 model.x[i1] = nil
+	 model.y[i1] = nil
+	 if alph1 < C and alph1 > 0 then
+	    nbound = nbound - 1
+	 end
+      end
+      -- Update multiplier a2
+      if a2 > 0 then
+	 model.a[i2] = a2
+	 acache[i2] = a2
+	 model.x[i2] = dataset[i2][1]
+	 model.y[i2] = dataset[i2][2][1]
+	 -- Keep track of nbound values
+	 if a2 < C and (alph2 >= C or alph2 <= 0) then
+	    nbound = nbound + 1
+	 elseif a2 >= C and alph2 < C and alph2 > 0 then
+	    nbound = nbound - 1
+	 end
+	 -- Keep track of ecache
+      else
+	 model.a[i2] = nil
+	 acache[i2] = 0
+	 model.x[i2] = nil
+	 model.y[i2] = nil
+	 if alph2 < C and alph2 > 0 then
+	    nbound = nbound - 1
+	 end
+      end
+      -- Update the bias b
+      local b = model.b
+      local b1 = model.b - E1 - y1*(a1-alph1)*k11 - y2*(a2-alph2)*k12
+      local b2 = model.b - E2 - y1*(a1-alph1)*k12 - y2*(a2-alph2)*k22
+      if a1 > 0 and a1 < C then
+	 model.b = b1
+      elseif a2 > 0 and a2 < C then
+	 model.b = b2
+      elseif L ~= H then
+	 model.b = (b1+b2)/2
+      end
+      -- Update ecache
+      local kk1 = 0
+      local kk2 = 0
+      -- Update ecache for i1
+      if a1 > 0 and a1 < C then
+	 ecache[i1] = kcache_f(dataset,i1)[1] - y1
+      end
+      -- Update cache for i2
+      if a2 > 0 and a2 < C then
+	 ecache[i2] = kcache_f(dataset,i2)[1] - y2
+      end
+      return 1
+   end
+   -- Examing an example cached version
+   local function examineExample_cache(dataset, i2, E2)
+      local y2 = dataset[i2][2][1]
+      local alph2 = model.a[i2] or 0
+      local r2 = E2*y2
+      local E1 = 0
+      local i1 = 0
+      if (r2 < -tol and alph2 < C) or (r2 > tol and alph2 > 0) then
+	 -- Second heuristics
+	 if nbound > 1 then
+	    if E2 > 0 then
+	       E1 = math.huge
+	       for k,v in pairs(model.a) do
+		  if model.a[k] < C then
+		     if ecache[k] < E1 then
+			i1 = k
+		     end
+		  end
+	       end
+	    else
+	       E1 = -math.huge
+	       for k,v in pairs(model.a) do
+		  if model.a[k] < C then
+		     if ecache[k] > E1 then
+			i1 = k
+		     end
+		  end
+	       end
+	    end
+	    E1 = kcache_f(dataset,i1)[1] - dataset[i1][2][1]
+	    if takeStep_cache(dataset, i1, i2, E1, E2) > 0 then
+	       return 1
+	    end
+	 end
+	 -- Heuristic hierarchy
+	 for i1,v in pairs(model.a) do
+	    if model.a[i1] < C then
+	       E1 = kcache_f(dataset,i1)[1] - dataset[i1][2][1]
+	       if takeStep_cache(dataset, i1, i2, E1, E2) > 0 then
+		  return 1
+	       end
+	    end
+	 end
+	 for i1 = 1, dataset:size() do
+	    E1 = kcache_f(dataset,i1)[1] - dataset[i1][2][1]
+	    if takeStep_cache(dataset, i1, i2, E1, E2) > 0 then
+	       return 1
+	    end
+	 end
+      end
+      return 0
+   end
+   -- A cached version of the platt's SMO algorithm (private function)
+   local function train_cache(dataset, stopChanged)
+      nbound = 0
+      kcache_init(dataset)
+      model.a = {}
+      model.b = 0
+      model.x = {}
+      model.y = {}
+      local numChanged = 0
+      local examineAll = 1
+      while numChanged > stopChanged or examineAll == 1 do
+	 numChanged = 0
+	 -- Examine all
+	 if examineAll == 1 then
+	    for i2 = 1,dataset:size() do
+	       numChanged = numChanged + examineExample_cache(dataset, i2, kcache_f(dataset,i2)[1]-dataset[i2][2][1])
+	    end
+	 else
+	    for i2, v in pairs(model.a) do
+	       if model.a[i2] < C then
+		  numChanged = numChanged + examineExample_cache(dataset, i2, kcache_f(dataset,i2)[1]-dataset[i2][2][1])
+	       end
+	    end
+	 end
+	 -- Loop value
+	 if examineAll == 1 then
+	    examineAll = 0
+	 elseif numChanged <= stopChanged then
+	    examineAll = 1
+	 end
+      end
+      kcache_clean()
+   end
+   function model:train(dataset)
+      train_cache(dataset, ratio_alpha_changes*dataset:size())
+      return model:test(dataset)
+   end
+   -- Test on a dataset
+   function model:test(dataset)
+      -- Counter for wrong classification
+      local error = 0
+      for i = 1,dataset:size() do
+	 -- Iterate error rate computation
+	 if torch.sum(torch.ne(model:g(dataset[i][1]), dataset[i][2])) == 0 then
+	    error = error*(i-1)/i
+	 else
+	    error = (error*i-error+1)/i
+	 end
+      end
+      return error
+   end
+   -- The decision function
+   function model:f(x)
+      local result = torch.zeros(1)
+      -- Iterate over all pairs
+      for k,v in pairs(model.a) do
+	 result[1] = result[1] + model.y[k]*model.a[k]*kernel(model.x[k],x)
+      end
+      result[1] = result[1] + model.b
+      -- Return result as a tensor
+      return result
+   end
+   -- The indicator function
+   function model:g(x)
+      local result = model:f(x)
+      if result[1] >= 0 then
+	 return torch.ones(1)
+      else
+	 return -torch.ones(1)
+      end
+   end
+   -- The number of support vectors
+   function model:nsv()
+      local count = 0
+      for k,v in pairs(model.a) do
+	 count = count + 1
+      end
+      return count
+   end
+   -- Return the object
+   return model
+end
+
+-- Vectorized Platt's original svm algorithm
+-- C: the regularization parameter;
+-- kernel: the kernel function; tol: tolerance on violation of KKT conditions
+-- eps: the eps to detect change
+function xsvm.fast(args)
+   local model = {a = {}, x = {}, y = {}, b = 0}
+   args = args or {}
+   -- If kernel undefined, using linear kernel
+   local kernel = args.kernel or function (x1,x2) return torch.dot(x1,x2) end
+   -- Default C is 1
+   local C = args.C or 0.05
+   -- Default cache is false
+   local cache = args.cache or false
+   -- Default tolerance is 1e-3
+   local tol = args.tol or 1e-3
+   -- Default eps (round-off error on Mercer condition) is 1e-5
+   local eps = args.eps or 1e-5
+   -- Recording the number of non-zero & non-C alpha
+   local nbound = 0
+   -- Cache helper
+   local ecache = torch.zeros(1)
+   local kcache = torch.zeros(1)
+   local ycache = torch.zeros(1)
+   local acache = torch.zeros(1)
+   -- Initializing the kernel cache
+   local function kcache_init(dataset)
+      -- Allocate cache tensors
+      ycache = torch.zeros(dataset:size())
+      acache = torch.zeros(dataset:size())
+      ecache = torch.zeros(dataset:size())
+      kcache = torch.zeros(dataset:size(), dataset:size())
+      for i = 1, dataset:size() do
+	 ycache[i] = dataset[i][2][1]
+	 for j = i, dataset:size() do
+	    local k = kernel(dataset[i][1],dataset[j][1])
+	    kcache[i][j] = k
+	    kcache[j][i] = k
+	 end
+      end
+   end
+   -- Query the cached value
+   local function kcache_query(dataset, i, j)
+      -- Return the cache
+      return kcache[i][j]
+   end
+   -- kcache utilized f function
+   local function kcache_f(dataset, i)
+      -- Return result as a tensor
+      return torch.ones(1)*(torch.dot(torch.cmul(acache,ycache), kcache[i]) + model.b);
+   end
+   -- Clean up the cache
+   local function kcache_clean()
+      kcache = torch.zeros(1)
+      ycache = torch.zeros(1)
+      acache = torch.zeros(1)
+      ecache = torch.zeros(1)
+   end
+   -- Cached helper takeStep function
+   local function takeStep_cache(dataset, i1, i2, E1, E2)
+      if i1 == i2 then
+	 return 0
+      end
+      -- Allocating values
+      local alph1 = model.a[i1] or 0
+      local alph2 = model.a[i2] or 0
+      local y1 = dataset[i1][2][1]
+      local y2 = dataset[i2][2][1]
+      local s = y1*y2
+      local L = 0
+      local H = C
+      if y1 == y2 then
+	 L = math.max(0, alph2 + alph1 - C)
+	 H = math.min(C, alph2 + alph1)
+      else
+	 L = math.max(0, alph2 - alph1)
+	 H = math.min(C, C + alph2 - alph1)
+      end
+      -- Compute the kernel values and step size
+      local k11 = kcache_query(dataset,i1,i1)
+      local k12 = kcache_query(dataset,i1,i2)
+      local k22 = kcache_query(dataset,i2,i2)
+      local eta = k11 + k22 - 2*k12
+      local a1 = alph1
+      local a2 = alph2
+      -- Check feasibility of eta (Mercer kernel)
+      if eta > 0 then
+	 -- Compute the new value of a2
+	 a2 = alph2 + y2*(E1-E2)/eta
+	 if a2 < L then
+	    a2 = L
+	 elseif a2 > H then
+	    a2 = H
+	 end
+      else
+	 local f1 = y1*(E1-model.b)-alph1*k11-s*alph2*k12
+	 local f2 = y1*(E2-model.b)-s*alph1*k12-alph2*k22
+	 local L1 = alph1 + s*(alph2 - L)
+	 local H1 = alph1 + s*(alph2 - H)
+	 local Lobj = L1*f1 + L*f2 + L1*L1*k11/2 + L*L*k22/2 + s*L*L1*k12
+	 local Hobj = H1*f1 + H*f2 + H1*H1*k11/2 + H*H*k22/2 + s*H*H1*k12
+	 -- Determine the new value of a2
+	 if Lobj < Hobj - eps then
+	    a2 = L
+	 elseif Lobj > Hobj + eps then
+	    a2 = H
+	 else
+	    a2 = alph2
+	 end
+      end
+      -- Do we change alph2 enough?
+      if math.abs(a2-alph2) < eps*(a2 + alph2 + eps) then
+	 return 0
+      end
+      -- Update a1
+      a1 = alph1 + s*(alph2 - a2)
+      -- Update multiplier a1
+      if a1 > 0 then
+	 model.a[i1] = a1
+	 acache[i1] = a1
+	 model.x[i1] = dataset[i1][1]
+	 model.y[i1] = dataset[i1][2][1]
+	 -- Keep track of nbound values
+	 if a1 < C and (alph1 >= C or alph1 <= 0) then
+	    nbound = nbound + 1
+	 elseif a1 >= C and alph1 < C and alph1 > 0 then
+	    nbound = nbound - 1
+	 end
+      else
+	 model.a[i1] = nil
+	 acache[i1] = 0
+	 model.x[i1] = nil
+	 model.y[i1] = nil
+	 if alph1 < C and alph1 > 0 then
+	    nbound = nbound - 1
+	 end
+      end
+      -- Update multiplier a2
+      if a2 > 0 then
+	 model.a[i2] = a2
+	 acache[i2] = a2
+	 model.x[i2] = dataset[i2][1]
+	 model.y[i2] = dataset[i2][2][1]
+	 -- Keep track of nbound values
+	 if a2 < C and (alph2 >= C or alph2 <= 0) then
+	    nbound = nbound + 1
+	 elseif a2 >= C and alph2 < C and alph2 > 0 then
+	    nbound = nbound - 1
+	 end
+	 -- Keep track of ecache
+      else
+	 model.a[i2] = nil
+	 acache[i2] = 0
+	 model.x[i2] = nil
+	 model.y[i2] = nil
+	 if alph2 < C and alph2 > 0 then
+	    nbound = nbound - 1
+	 end
+      end
+      -- Update the bias b
+      local b = model.b
+      local b1 = model.b - E1 - y1*(a1-alph1)*k11 - y2*(a2-alph2)*k12
+      local b2 = model.b - E2 - y1*(a1-alph1)*k12 - y2*(a2-alph2)*k22
+      if a1 > 0 and a1 < C then
+	 model.b = b1
+      elseif a2 > 0 and a2 < C then
+	 model.b = b2
+      elseif L ~= H then
+	 model.b = (b1+b2)/2
+      end
+      -- Update ecache
+      local kk1 = 0
+      local kk2 = 0
+      -- Update ecache for i1
+      if a1 > 0 and a1 < C then
+	 if alph1 <= 0 or alph1 >= C then
+	    ecache[i1] = kcache_f(dataset,i1)[1] - y1
+	 else
+	    ecache[i1] = ecache[i1] + (model.b - b) + (a1-alph1)*y1*k11 + (a2-alph2)*y2*k12
+	 end
+      end
+      -- Update cache for i2
+      if a2 > 0 and a2 < C then
+	 if alph2 <= 0 or alph2 >= C then
+	    ecache[i2] = kcache_f(dataset,i2)[1] - y2
+	 else
+	    ecache[i2] = ecache[i2] + (model.b - b) + (a1-alph1)*y1*k12 + (a2-alph2)*y2*k22
+	 end
+      end
+      -- Update cache for everybody we care about
+      for k, v in pairs(model.a) do
+	 if model.a[k] < C and k ~= i1 and k ~= i2 then
+	    kk1 = kcache_query(dataset,i1, k)
+	    kk2 = kcache_query(dataset,i2, k)
+	    ecache[k] = ecache[k] + (model.b - b) + (a1-alph1)*y1*kk1 + (a2-alph2)*y2*kk2
+	 end
+      end
+      return 1
+   end
+   -- Examing an example cached version
+   local function examineExample_cache(dataset, i2, E2)
+      local y2 = dataset[i2][2][1]
+      local alph2 = model.a[i2] or 0
+      local r2 = E2*y2
+      local E1 = 0
+      local i1 = 0
+      if (r2 < -tol and alph2 < C) or (r2 > tol and alph2 > 0) then
+	 -- Second heuristics
+	 if nbound > 1 then
+	    if E2 > 0 then
+	       E1 = math.huge
+	       for k,v in pairs(model.a) do
+		  if model.a[k] < C then
+		     if ecache[k] < E1 then
+			E1 = ecache[k]
+			i1 = k
+		     end
+		  end
+	       end
+	    else
+	       E1 = -math.huge
+	       for k,v in pairs(model.a) do
+		  if model.a[k] < C then
+		     if ecache[k] > E1 then
+			E1 = ecache[k]
+			i1 = k
+		     end
+		  end
+	       end
+	    end
+	    if takeStep_cache(dataset, i1, i2, E1, E2) > 0 then
+	       return 1
+	    end
+	 end
+	 -- Heuristic hierarchy
+	 for i1,v in pairs(model.a) do
+	    if model.a[i1] < C then
+	       E1 = ecache[i1]
+	       if takeStep_cache(dataset, i1, i2, E1, E2) > 0 then
+		  return 1
+	       end
+	    end
+	 end
+	 for i1 = 1, dataset:size() do
+	    E1 = kcache_f(dataset,i1)[1] - dataset[i1][2][1]
+	    if takeStep_cache(dataset, i1, i2, E1, E2) > 0 then
+	       return 1
+	    end
+	 end
+      end
+      return 0
+   end
+   -- A cached version of the platt's SMO algorithm (private function)
+   local function train_cache(dataset)
+      nbound = 0
+      kcache_init(dataset)
+      model.a = {}
+      model.b = 0
+      model.x = {}
+      model.y = {}
+      local numChanged = 0
+      local examineAll = 1
+      while numChanged > 0 or examineAll == 1 do
+	 numChanged = 0
+	 -- Examine all
+	 if examineAll == 1 then
+	    for i2 = 1,dataset:size() do
+	       numChanged = numChanged + examineExample_cache(dataset, i2, kcache_f(dataset,i2)[1]-dataset[i2][2][1])
+	    end
+	 else
+	    for i2, v in pairs(model.a) do
+	       if model.a[i2] < C then
+		  numChanged = numChanged + examineExample_cache(dataset, i2, ecache[i2])
+	       end
+	    end
+	 end
+	 -- Loop value
+	 if examineAll == 1 then
+	    examineAll = 0
+	 elseif numChanged == 0 then
+	    examineAll = 1
+	 end
+      end
+      kcache_clean()
+   end
+   function model:train(dataset)
+      train_cache(dataset)
       return model:test(dataset)
    end
    -- Test on a dataset

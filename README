@@ -1,21 +1,58 @@
-Xiang's Kernel SVM Library in Torch 7
+Xiang's Kernel SVM in Torch 7
+By Xiang Zhang @ New York University
+10/06/2012, Version 0.3
 
-This library contains SMO (sequential minimal optimization) variants for kernel support vector machines.
+---------------------------------------------
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty ofMERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+---------------------------------------------
+
+DOCUMENTATION
+
+This library contains SMO (sequential minimal optimization) variants for kernel
+support vector machines.
 xsvm.simple(args): A simplified SMO algorithm[1]
 xsvm.platt(args): John C. Platt's original SMO algorithm[2]
 xsvm.tweaked(args): A tweaked heuristic version of Platt's algorithm
-
+xsvm.vectorized(args): A vectorized version of the tweaked algorithm
+xsvm.fast(args): A vectorized version of Platt's original SMO algorithm
 
 They can be used in this way:
 model = xsvm.simple{C = 0.05, cache = true, kernel = kfunc} -- create model
 model:train(dataset) -- Train on a dataset. The training error is returned.
 model:test(dataset) -- Test on a dataset. The testing error is returned.
-vmodel:f(x) -- The output function
-model:g(x) -- The decision function (return -1 or 1)
+model:f(x) -- The output function
+model:g(x) -- The decision function (return -1 or 1 as a tensor)
+model:nsv() -- Query how many support vectors are there for a trained model
 
-xsvm.simple(), xsvm.platt() and xsvm.tweaked() have the same protocols for controlling the parameter C (default 0.05), whether to cache (default false) and the kernel function (default is inner-product between vectors, i.e., linear model)
+xsvm.simple(), xsvm.platt() and xsvm.tweaked() have the same protocols for controlling the parameter C (default 0.05), whether to cache (default false) and the kernel function (default is inner-product between vectors, i.e., linear model). You will not be able to control whether to cache in xsvm.vectorized() and xsvm.fast(). They must enable cache for vectorization.
 
-Generally speaking, xsvm.simple() is faster but its result is random because it does not exactly solve the problem. It also does not handle non-PSD kernels well. xsvm.platt() is the original SMO algorithm which gives consistent solution, and sometimes it will handle non-PSD kernels. xsvm.tweaked() is a heuristic version of the original SMO algorithm, which is much faster, but its optimality may not be as good.
+We recommend you to use xsvm.vectorized() if memory is not a constraint. Otherwise, xsvm.tweaked() is probably the best option.
+
+Generally speaking, xsvm.simple() is just an example code to understand thealgorithm. Do not use it in actual applications, because the result is randomas it does not exactly solve the problem. xsvm.platt() is the original SMOalgorithm which gives consistent solution. xsvm.tweaked() is a heuristic version of the original SMO algorithm, which is much faster, but its optimalitymay not be as good (but not bad as well). xsvm.fast() is the vectorized version of xsvm.platt(). xsvm.vectorized() is the vectorized version of xsvm.tweaked().
+
+The speed comparison of the algorithms are generally as the follows ('>' represents faster than):
+xsvm.vectorized() > xsvm.fast() > xsvm.tweaked() > xsvm.simple() > xsvm.platt()
+
+The memory usage comparision of the algorithms are as follows ('>' represents more memory usage):
+xsvm.vectorized() = xsvm.fast() > xsvm.tweaked{cache = true} = xsvm.platt{cache = true} = xsvm.simple{cache = true} > xsvm.tweaked{cache = false} = xsvm.platt{cache = false} = xsvm.simple{cache = false}
+
+The optimality comparison of the algorithms are as follows ('>' represents better optimality guarantee):
+xsvm.fast() = xsvm.platt() > xsvm.vectorized() = xsvm.tweaked() > xsvm.simple()
 
 The dataset format follows the convention of Torch 7 tutorial, and I quote it here:
 "A dataset is an object which implements the operator dataset[index] and implements the method dataset:size(). The size() methods returns the number of examples and dataset[i] has to return the i-th example. An example has to be an object which implements the operator example[field], where field often takes the value 1 (for input features) or 2 (for corresponding labels), i.e an example is a pair of input and output objects."
+
+The support vectors are stored in the table model.a, where if model.a[i] = nil it means the dual variable with respect to the i training sample is 0. Support vectors and their labels are stored in table model.x and model.y respectively, following the same convention as model.a. The bias parameter is stored at model.b.
+
+---------------------------------------------
+
+REFERENCES
+
+[1] Andrew Ng. The Simplified SMO Algorithm. Lecture Notes for Stanford CS229 in Autumn 2009. http://cs229.stanford.edu/materials/smo.pdf
+[2] John C. Platt. Sequential minimal optimization: A fast algorithm for training support vector machines. Technical Report MSR-TR-98-14 April 21, 1998
