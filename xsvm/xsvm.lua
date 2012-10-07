@@ -448,7 +448,7 @@ end
 -- Platt's original svm algorithm
 -- C: the regularization parameter; cache: whether to cache the kernel function
 -- kernel: the kernel function; tol: tolerance on violation of KKT conditions
--- eps: the eps to detect change
+-- eps: the eps to detect change; maxIterRatio: maximum number of iterations is this number times dataset
 function xsvm.platt(args)
    local model = {a = {}, x = {}, y = {}, b = 0}
    args = args or {}
@@ -460,8 +460,10 @@ function xsvm.platt(args)
    local cache = args.cache or false
    -- Default tolerance is 1e-3
    local tol = args.tol or 1e-3
-   -- Default eps (round-off error on Mercer condition) is 1e-5
-   local eps = args.eps or 1e-5
+   -- Default eps (round-off error on Mercer condition) is 1e-3
+   local eps = args.eps or 1e-3
+   -- Maximum number of iterations is this number times dataset size
+   local maxIterRatio = args.maxIterRatio or 20
    -- Recording the number of non-zero & non-C alpha
    local nbound = 0
    -- The error cache
@@ -706,7 +708,9 @@ function xsvm.platt(args)
       model.y = {}
       local numChanged = 0
       local examineAll = 1
-      while numChanged > 0 or examineAll == 1 do
+      local maxIter = maxIterRation*dataset:size()
+      local numIter = 0
+      while numIter < maxIter and (numChanged > 0 or examineAll == 1) do
 	 numChanged = 0
 	 -- Examine all
 	 if examineAll == 1 then
@@ -726,6 +730,7 @@ function xsvm.platt(args)
 	 elseif numChanged == 0 then
 	    examineAll = 1
 	 end
+	 numIter = numIter + 1
       end
       ecache = torch.zeros(1)
       kcache_clean()
@@ -930,7 +935,9 @@ function xsvm.platt(args)
       model.y = {}
       local numChanged = 0
       local examineAll = 1
-      while numChanged > 0 or examineAll == 1 do
+      local maxIter = maxIterRatio * dataset:size()
+      local numIter = 0
+      while numIter < maxIter and (numChanged > 0 or examineAll == 1) do
 	 numChanged = 0
 	 -- Examine all
 	 if examineAll == 1 then
@@ -950,6 +957,7 @@ function xsvm.platt(args)
 	 elseif numChanged == 0 then
 	    examineAll = 1
 	 end
+	 numIter = numIter + 1
       end
       ecache = torch.zeros(1)
    end
@@ -1012,6 +1020,8 @@ end
 -- C: the regularization parameter; cache: whether to cache the kernel function
 -- kernel: the kernel function; tol: tolerance on violation of KKT conditions
 -- eps: the eps to detect change; ratio_alpha_changed: a heuristic for stopping
+-- maxIterRation: maximum number of iterations is this number time dataset size
+-- maxAllIter: maximum number of iterations through all the data points.
 function xsvm.tweaked(args)
    local model = {a = {}, x = {}, y = {}, b = 0}
    args = args or {}
@@ -1023,10 +1033,14 @@ function xsvm.tweaked(args)
    local cache = args.cache or false
    -- Default tolerance is 1e-3
    local tol = args.tol or 1e-3
-   -- Default eps (round-off error on Mercer condition) is 1e-5
-   local eps = args.eps or 1e-5
+   -- Default eps (round-off error on Mercer condition) is 1e-3
+   local eps = args.eps or 1e-3
    -- Default ratio alpha changes is 1%
    local ratio_alpha_changes = args.ratio_alpha_changes or 0.01
+   -- Maximum number of iterations is this ratio times dataset size
+   local maxIterRatio = args.maxIterRatio or 20
+   -- Maximum number of all iterations
+   local maxAllIter = args.maxAllIter or 20
    -- Recording the number of non-zero & non-C alpha
    local nbound = 0
    -- The error cache
@@ -1192,52 +1206,83 @@ function xsvm.tweaked(args)
       return 1
    end
    -- Examing an example cached version
-   local function examineExample_cache(dataset, i2, E2)
+   local function examineExample_cache(dataset, i2, E2, examineAll)
       local y2 = dataset[i2][2][1]
       local alph2 = model.a[i2] or 0
       local r2 = E2*y2
       local E1 = 0
       local i1 = 0
-      if (r2 < -tol and alph2 < C) or (r2 > tol and alph2 > 0) then
-	 -- Second heuristics
-	 if nbound > 1 then
-	    if E2 > 0 then
-	       E1 = math.huge
-	       for k,v in pairs(model.a) do
-		  if model.a[k] < C then
-		     if ecache[k] < E1 then
-			i1 = k
+      if examineAll == 1 then
+	 if (r2 < -tol and alph2 < C) or (r2 > tol and alph2 > 0) then
+	    -- Second heuristics
+	    if nbound > 1 then
+	       if E2 > 0 then
+		  E1 = math.huge
+		  for k,v in pairs(model.a) do
+		     if model.a[k] < C then
+			if ecache[k] < E1 then
+			   i1 = k
+			end
+		     end
+		  end
+	       else
+		  E1 = -math.huge
+		  for k,v in pairs(model.a) do
+		     if model.a[k] < C then
+			if ecache[k] > E1 then
+			   i1 = k
+			end
 		     end
 		  end
 	       end
-	    else
-	       E1 = -math.huge
-	       for k,v in pairs(model.a) do
-		  if model.a[k] < C then
-		     if ecache[k] > E1 then
-			i1 = k
-		     end
+	       E1 = kcache_f(dataset,i1)[1] - dataset[i1][2][1]
+	       if takeStep_cache(dataset, i1, i2, E1, E2) > 0 then
+		  return 1
+	       end
+	    end
+	    -- Heuristic hierarchy
+	    for i1,v in pairs(model.a) do
+	       if model.a[i1] < C then
+		  E1 = kcache_f(dataset,i1)[1] - dataset[i1][2][1]
+		  if takeStep_cache(dataset, i1, i2, E1, E2) > 0 then
+		     return 1
 		  end
 	       end
 	    end
-	    E1 = kcache_f(dataset,i1)[1] - dataset[i1][2][1]
-	    if takeStep_cache(dataset, i1, i2, E1, E2) > 0 then
-	       return 1
-	    end
-	 end
-	 -- Heuristic hierarchy
-	 for i1,v in pairs(model.a) do
-	    if model.a[i1] < C then
+	    for i1 = 1, dataset:size() do
 	       E1 = kcache_f(dataset,i1)[1] - dataset[i1][2][1]
 	       if takeStep_cache(dataset, i1, i2, E1, E2) > 0 then
 		  return 1
 	       end
 	    end
 	 end
-	 for i1 = 1, dataset:size() do
-	    E1 = kcache_f(dataset,i1)[1] - dataset[i1][2][1]
-	    if takeStep_cache(dataset, i1, i2, E1, E2) > 0 then
-	       return 1
+      else
+	 if (r2 < -tol and alph2 < C) or (r2 > tol and alph2 > 0) then
+	    -- Second heuristics
+	    if nbound > 1 then
+	       if E2 > 0 then
+		  E1 = math.huge
+		  for k,v in pairs(model.a) do
+		     if model.a[k] < C then
+			if ecache[k] < E1 then
+			   i1 = k
+			end
+		     end
+		  end
+	       else
+		  E1 = -math.huge
+		  for k,v in pairs(model.a) do
+		     if model.a[k] < C then
+			if ecache[k] > E1 then
+			   i1 = k
+			end
+		     end
+		  end
+	       end
+	       E1 = kcache_f(dataset,i1)[1] - dataset[i1][2][1]
+	       if takeStep_cache(dataset, i1, i2, E1, E2) > 0 then
+		  return 1
+	       end
 	    end
 	 end
       end
@@ -1254,17 +1299,21 @@ function xsvm.tweaked(args)
       model.y = {}
       local numChanged = 0
       local examineAll = 1
-      while numChanged > stopChanged or examineAll == 1 do
+      local maxIter = maxIterRatio * dataset:size()
+      local numIter = 0
+      local numAllIter = 0
+      while numAllIter < maxAllIter and numIter < maxIter and (numChanged > stopChanged or examineAll == 1) do
 	 numChanged = 0
 	 -- Examine all
 	 if examineAll == 1 then
 	    for i2 = 1,dataset:size() do
-	       numChanged = numChanged + examineExample_cache(dataset, i2, kcache_f(dataset,i2)[1]-dataset[i2][2][1])
+	       numChanged = numChanged + examineExample_cache(dataset, i2, kcache_f(dataset,i2)[1]-dataset[i2][2][1], examineAll)
 	    end
+	    numAllIter = numAllIter + 1
 	 else
 	    for i2, v in pairs(model.a) do
 	       if model.a[i2] < C then
-		  numChanged = numChanged + examineExample_cache(dataset, i2, kcache_f(dataset,i2)[1]-dataset[i2][2][1])
+		  numChanged = numChanged + examineExample_cache(dataset, i2, kcache_f(dataset,i2)[1]-dataset[i2][2][1], examineAll)
 	       end
 	    end
 	 end
@@ -1274,6 +1323,7 @@ function xsvm.tweaked(args)
 	 elseif numChanged <= stopChanged then
 	    examineAll = 1
 	 end
+	 numIter = numIter + 1
       end
       ecache = torch.zeros(1)
       kcache_clean()
@@ -1397,52 +1447,83 @@ function xsvm.tweaked(args)
       return 1
    end
    -- Examing an example noncached version
-   local function examineExample_ncache(dataset, i2, E2)
+   local function examineExample_ncache(dataset, i2, E2, examineAll)
       local y2 = dataset[i2][2][1]
       local alph2 = model.a[i2] or 0
       local r2 = E2*y2
       local E1 = 0
       local i1 = 0
-      if (r2 < -tol and alph2 < C) or (r2 > tol and alph2 > 0) then
-	 -- Second heuristics
-	 if nbound > 1 then
-	    if E2 > 0 then
-	       E1 = math.huge
-	       for k,v in pairs(model.a) do
-		  if model.a[k] < C then
-		     if ecache[k] < E1 then
-			i1 = k
+      if examineAll == 1 then
+	 if (r2 < -tol and alph2 < C) or (r2 > tol and alph2 > 0) then
+	    -- Second heuristics
+	    if nbound > 1 then
+	       if E2 > 0 then
+		  E1 = math.huge
+		  for k,v in pairs(model.a) do
+		     if model.a[k] < C then
+			if ecache[k] < E1 then
+			   i1 = k
+			end
+		     end
+		  end
+	       else
+		  E1 = -math.huge
+		  for k,v in pairs(model.a) do
+		     if model.a[k] < C then
+			if ecache[k] > E1 then
+			   i1 = k
+			end
 		     end
 		  end
 	       end
-	    else
-	       E1 = -math.huge
-	       for k,v in pairs(model.a) do
-		  if model.a[k] < C then
-		     if ecache[k] > E1 then
-			i1 = k
-		     end
+	       E1 = model:f(dataset[i1][1])[1] - dataset[i1][2][1]
+	       if takeStep_ncache(dataset, i1, i2, E1, E2) > 0 then
+		  return 1
+	       end
+	    end
+	    -- Heuristic hierarchy
+	    for i1,v in pairs(model.a) do
+	       if model.a[i1] < C then
+		  E1 = model:f(dataset[i1][1])[1] - dataset[i1][2][1]
+		  if takeStep_ncache(dataset, i1, i2, E1, E2) > 0 then
+		     return 1
 		  end
 	       end
 	    end
-	    E1 = model:f(dataset[i1][1])[1] - dataset[i1][2][1]
-	    if takeStep_ncache(dataset, i1, i2, E1, E2) > 0 then
-	       return 1
-	    end
-	 end
-	 -- Heuristic hierarchy
-	 for i1,v in pairs(model.a) do
-	    if model.a[i1] < C then
+	    for i1 = 1, dataset:size() do
 	       E1 = model:f(dataset[i1][1])[1] - dataset[i1][2][1]
 	       if takeStep_ncache(dataset, i1, i2, E1, E2) > 0 then
 		  return 1
 	       end
 	    end
 	 end
-	 for i1 = 1, dataset:size() do
-	    E1 = model:f(dataset[i1][1])[1] - dataset[i1][2][1]
-	    if takeStep_ncache(dataset, i1, i2, E1, E2) > 0 then
-	       return 1
+      else
+	 if (r2 < -tol and alph2 < C) or (r2 > tol and alph2 > 0) then
+	    -- Second heuristics
+	    if nbound > 1 then
+	       if E2 > 0 then
+		  E1 = math.huge
+		  for k,v in pairs(model.a) do
+		     if model.a[k] < C then
+			if ecache[k] < E1 then
+			   i1 = k
+			end
+		     end
+		  end
+	       else
+		  E1 = -math.huge
+		  for k,v in pairs(model.a) do
+		     if model.a[k] < C then
+			if ecache[k] > E1 then
+			   i1 = k
+			end
+		     end
+		  end
+	       end
+	       E1 = model:f(dataset[i1][1])[1] - dataset[i1][2][1]
+	       if takeStep_ncache(dataset, i1, i2, E1, E2) > 0 then
+		  return 1
+	       end
 	    end
 	 end
       end
@@ -1456,19 +1537,23 @@ function xsvm.tweaked(args)
       model.b = 0
       model.x = {}
       model.y = {}
-      local numChanged = 0
+      local numChanged = math.huge
+      local numIter = 0
       local examineAll = 1
-      while numChanged > stopChanged or examineAll == 1 do
+      local maxIter = maxIterRatio * dataset:size()
+      local numAllIter = 0
+      while numAllIter < maxAllIter and numIter < maxIter and (numChanged > stopChanged or examineAll == 1) do
 	 numChanged = 0
 	 -- Examine all
 	 if examineAll == 1 then
 	    for i2 = 1,dataset:size() do
-	       numChanged = numChanged + examineExample_ncache(dataset, i2, model:f(dataset[i2][1])[1]-dataset[i2][2][1])
+	       numChanged = numChanged + examineExample_ncache(dataset, i2, model:f(dataset[i2][1])[1]-dataset[i2][2][1], examineAll)
 	    end
+	    numAllIter = numAllIter + 1
 	 else
 	    for i2, v in pairs(model.a) do
 	       if model.a[i2] < C then
-		  numChanged = numChanged + examineExample_ncache(dataset, i2, model:f(dataset[i2][1])[1]-dataset[i2][2][1])
+		  numChanged = numChanged + examineExample_ncache(dataset, i2, model:f(dataset[i2][1])[1]-dataset[i2][2][1], examineAll)
 	       end
 	    end
 	 end
@@ -1478,6 +1563,7 @@ function xsvm.tweaked(args)
 	 elseif numChanged <= stopChanged then
 	    examineAll = 1
 	 end
+	 numIter = numIter + 1
       end
       ecache = torch.zeros(1)
    end
@@ -1540,6 +1626,8 @@ end
 -- C: the regularization parameter
 -- kernel: the kernel function; tol: tolerance on violation of KKT conditions
 -- eps: the eps to detect change; ratio_alpha_changed: a heuristic for stopping
+-- maxIterRatio: maximum number of iterations to stop is this number times dataset size
+-- maxAllIter: maximum number of all iterations
 function xsvm.vectorized(args)
    local model = {a = {}, x = {}, y = {}, b = 0}
    args = args or {}
@@ -1549,12 +1637,16 @@ function xsvm.vectorized(args)
    local C = args.C or 0.05
    -- Default tolerance is 1e-3
    local tol = args.tol or 1e-3
-   -- Default eps (round-off error on Mercer condition) is 1e-5
-   local eps = args.eps or 1e-5
+   -- Default eps (round-off error on Mercer condition) is 1e-3
+   local eps = args.eps or 1e-3
    -- Default ratio alpha changes is 1%
    local ratio_alpha_changes = args.ratio_alpha_changes or 0.01
    -- Recording the number of non-zero & non-C alpha
    local nbound = 0
+   -- Maximum number of iterations is this ratio times dataset size
+   local maxIterRatio = args.maxIterRatio or 20
+   -- Maximum number of all iteration iterations
+   local maxAllIter = args.minStabIter or 20
    -- Cache helper
    local ecache = torch.zeros(1)
    local kcache = torch.zeros(1)
@@ -1719,52 +1811,85 @@ function xsvm.vectorized(args)
       return 1
    end
    -- Examing an example cached version
-   local function examineExample_cache(dataset, i2, E2)
+   local function examineExample_cache(dataset, i2, E2, examineAll)
       local y2 = dataset[i2][2][1]
       local alph2 = model.a[i2] or 0
       local r2 = E2*y2
       local E1 = 0
       local i1 = 0
-      if (r2 < -tol and alph2 < C) or (r2 > tol and alph2 > 0) then
-	 -- Second heuristics
-	 if nbound > 1 then
-	    if E2 > 0 then
-	       E1 = math.huge
-	       for k,v in pairs(model.a) do
-		  if model.a[k] < C then
-		     if ecache[k] < E1 then
-			i1 = k
+      if examineAll == 1 then
+	 -- Use full heuristic hierarchy
+	 if (r2 < -tol and alph2 < C) or (r2 > tol and alph2 > 0) then
+	    -- Second heuristics
+	    if nbound > 1 then
+	       if E2 > 0 then
+		  E1 = math.huge
+		  for k,v in pairs(model.a) do
+		     if model.a[k] < C then
+			if ecache[k] < E1 then
+			   i1 = k
+			end
+		     end
+		  end
+	       else
+		  E1 = -math.huge
+		  for k,v in pairs(model.a) do
+		     if model.a[k] < C then
+			if ecache[k] > E1 then
+			   i1 = k
+			end
 		     end
 		  end
 	       end
-	    else
-	       E1 = -math.huge
-	       for k,v in pairs(model.a) do
-		  if model.a[k] < C then
-		     if ecache[k] > E1 then
-			i1 = k
-		     end
+	       E1 = kcache_f(dataset,i1)[1] - dataset[i1][2][1]
+	       if takeStep_cache(dataset, i1, i2, E1, E2) > 0 then
+		  return 1
+	       end
+	    end
+	    -- Heuristic hierarchy
+	    for i1,v in pairs(model.a) do
+	       if model.a[i1] < C then
+		  E1 = kcache_f(dataset,i1)[1] - dataset[i1][2][1]
+		  if takeStep_cache(dataset, i1, i2, E1, E2) > 0 then
+		     return 1
 		  end
 	       end
 	    end
-	    E1 = kcache_f(dataset,i1)[1] - dataset[i1][2][1]
-	    if takeStep_cache(dataset, i1, i2, E1, E2) > 0 then
-	       return 1
-	    end
-	 end
-	 -- Heuristic hierarchy
-	 for i1,v in pairs(model.a) do
-	    if model.a[i1] < C then
+	    for i1 = 1, dataset:size() do
 	       E1 = kcache_f(dataset,i1)[1] - dataset[i1][2][1]
 	       if takeStep_cache(dataset, i1, i2, E1, E2) > 0 then
 		  return 1
 	       end
 	    end
 	 end
-	 for i1 = 1, dataset:size() do
-	    E1 = kcache_f(dataset,i1)[1] - dataset[i1][2][1]
-	    if takeStep_cache(dataset, i1, i2, E1, E2) > 0 then
-	       return 1
+      else
+	 -- Using partial heuristic hierarchy concerning current support vectors only
+	 if (r2 < -tol and alph2 < C) or (r2 > tol and alph2 > 0) then
+	    -- Second heuristics
+	    if nbound > 1 then
+	       if E2 > 0 then
+		  E1 = math.huge
+		  for k,v in pairs(model.a) do
+		     if model.a[k] < C then
+			if ecache[k] < E1 then
+			   i1 = k
+			end
+		     end
+		  end
+	       else
+		  E1 = -math.huge
+		  for k,v in pairs(model.a) do
+		     if model.a[k] < C then
+			if ecache[k] > E1 then
+			   i1 = k
+		     end
+		     end
+		  end
+	       end
+	       E1 = kcache_f(dataset,i1)[1] - dataset[i1][2][1]
+	       if takeStep_cache(dataset, i1, i2, E1, E2) > 0 then
+		  return 1
+	       end
 	    end
 	 end
       end
@@ -1778,19 +1903,23 @@ function xsvm.vectorized(args)
       model.b = 0
       model.x = {}
       model.y = {}
-      local numChanged = 0
+      local numChanged = math.huge
       local examineAll = 1
-      while numChanged > stopChanged or examineAll == 1 do
+      local numIter = 0
+      local maxIter = maxIterRatio*dataset:size()
+      local numAllIter = 0
+      while numAllIter < maxAllIter and numIter < maxIter and (numChanged > stopChanged or examineAll == 1) do
 	 numChanged = 0
 	 -- Examine all
 	 if examineAll == 1 then
 	    for i2 = 1,dataset:size() do
-	       numChanged = numChanged + examineExample_cache(dataset, i2, kcache_f(dataset,i2)[1]-dataset[i2][2][1])
+	       numChanged = numChanged + examineExample_cache(dataset, i2, kcache_f(dataset,i2)[1]-dataset[i2][2][1], examineAll)
 	    end
+	    numAllIter = numAllIter + 1
 	 else
 	    for i2, v in pairs(model.a) do
 	       if model.a[i2] < C then
-		  numChanged = numChanged + examineExample_cache(dataset, i2, kcache_f(dataset,i2)[1]-dataset[i2][2][1])
+		  numChanged = numChanged + examineExample_cache(dataset, i2, kcache_f(dataset,i2)[1]-dataset[i2][2][1], examineAll)
 	       end
 	    end
 	 end
@@ -1800,6 +1929,7 @@ function xsvm.vectorized(args)
 	 elseif numChanged <= stopChanged then
 	    examineAll = 1
 	 end
+	 numIter = numIter + 1
       end
       kcache_clean()
    end
@@ -1856,7 +1986,7 @@ end
 -- Vectorized Platt's original svm algorithm
 -- C: the regularization parameter;
 -- kernel: the kernel function; tol: tolerance on violation of KKT conditions
--- eps: the eps to detect change
+-- eps: the eps to detect change; maxIterRatio: maximum number of iterations is this number times dataset size
 function xsvm.fast(args)
    local model = {a = {}, x = {}, y = {}, b = 0}
    args = args or {}
@@ -1868,8 +1998,10 @@ function xsvm.fast(args)
    local cache = args.cache or false
    -- Default tolerance is 1e-3
    local tol = args.tol or 1e-3
-   -- Default eps (round-off error on Mercer condition) is 1e-5
-   local eps = args.eps or 1e-5
+   -- Default eps (round-off error on Mercer condition) is 1e-3
+   local eps = args.eps or 1e-3
+   -- Maximum number of iterations is this ratio times dataset size
+   local maxIterRatio = args.maxIterRatio or 20
    -- Recording the number of non-zero & non-C alpha
    local nbound = 0
    -- Cache helper
@@ -2114,7 +2246,9 @@ function xsvm.fast(args)
       model.y = {}
       local numChanged = 0
       local examineAll = 1
-      while numChanged > 0 or examineAll == 1 do
+      local numIter = 0
+      local maxIter = maxIterRatio*dataset:size()
+      while numIter < maxIter and (numChanged > 0 or examineAll == 1) do
 	 numChanged = 0
 	 -- Examine all
 	 if examineAll == 1 then
@@ -2134,6 +2268,7 @@ function xsvm.fast(args)
 	 elseif numChanged == 0 then
 	    examineAll = 1
 	 end
+	 numIter = numIter + 1
       end
       kcache_clean()
    end
